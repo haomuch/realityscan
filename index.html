@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Reality SNI 在线筛选器</title>
+  <style>
+    :root {
+      --bg: #0b0f19; --card: #131a2a; --border: #243049;
+      --text: #e2e8f0; --muted: #94a3b8; --primary: #38bdf8;
+      --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --code-bg: #070a12;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.6; padding: 24px 16px 60px;
+    }
+    .container { max-width: 1060px; margin: 0 auto; }
+    header { text-align: center; margin-bottom: 24px; }
+    header h1 {
+      font-size: 1.85rem;
+      background: linear-gradient(90deg, #38bdf8, #10b981);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    header p { color: var(--muted); font-size: 0.92rem; margin-top: 6px; }
+
+    .panel {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      padding: 20px; margin-bottom: 20px;
+    }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    input, select {
+      background: var(--code-bg); border: 1px solid var(--border); color: var(--text);
+      padding: 12px 16px; border-radius: 10px; font-size: 1rem; outline: none;
+    }
+    input { flex: 1; min-width: 240px; font-family: monospace; }
+    input:focus, select:focus { border-color: var(--primary); }
+    button {
+      background: var(--primary); color: #04101d; font-weight: 700; border: none;
+      padding: 12px 24px; border-radius: 10px; cursor: pointer; font-size: 0.96rem;
+      transition: background 0.2s;
+    }
+    button:hover:not(:disabled) { background: #7dd3fc; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .badge { padding: 3px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+    .b-info { background: rgba(56,189,248,0.15); color: var(--primary); }
+    .b-ok { background: rgba(16,185,129,0.15); color: var(--success); }
+    .b-err { background: rgba(239,68,68,0.15); color: var(--danger); }
+
+    .progress-wrap { width: 100%; height: 8px; background: var(--code-bg); border-radius: 999px; overflow: hidden; margin: 12px 0; }
+    .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #38bdf8, #10b981); transition: width 0.25s; }
+    .log-box {
+      background: var(--code-bg); border: 1px solid #1b2438; border-radius: 8px; padding: 10px 14px;
+      font-family: monospace; font-size: 0.8rem; color: #94a3b8; max-height: 160px; overflow-y: auto;
+    }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 14px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; position: relative;
+    }
+    .card.top1 { border-color: rgba(16,185,129,0.7); box-shadow: 0 0 20px rgba(16,185,129,0.08); }
+    .rank {
+      position: absolute; top: 14px; right: 14px; font-size: 0.75rem; font-weight: 700;
+      padding: 3px 10px; border-radius: 999px; background: rgba(16,185,129,0.2); color: var(--success);
+    }
+    .domain { font-size: 1.15rem; font-weight: 700; font-family: monospace; color: #fff; padding-right: 72px; word-break: break-all; }
+    .meta { font-family: monospace; font-size: 0.84rem; color: var(--primary); margin: 6px 0 12px; }
+    .btn-sm { padding: 6px 12px; font-size: 0.8rem; border-radius: 8px; background: #1e293b; color: var(--text); border: 1px solid var(--border); }
+    .btn-sm:hover { background: #2c3b55; }
+
+    table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px; overflow: hidden; font-size: 0.85rem; margin-top: 12px; }
+    th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { background: #172033; color: var(--muted); }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Reality SNI 在线筛选器</h1>
+    <p>相邻物理网段被动 DNS 与反向检索 · 真实 HTTPS 握手 · 多维度 Cloudflare CDN 深度剔除</p>
+  </header>
+
+  <div class="panel">
+    <div class="row">
+      <input type="text" id="ipInput" value="" placeholder="请输入您的 VPS 公网 IPv4 地址" autocomplete="off" />
+      <select id="scopeSelect">
+        <option value="1">扫描范围：同 /24 子网 (254 个 IP)</option>
+        <option value="2" selected>扫描范围：同 /24 + 相邻 /24 子网 (508 个 IP)</option>
+      </select>
+      <button id="scanBtn" onclick="startScan()">开始扫描</button>
+    </div>
+    <div class="badges">
+      <span class="badge b-info">Passive DNS + 全网段反向检索</span>
+      <span class="badge b-ok">TLS 1.3 & HTTP/2 探活</span>
+      <span class="badge b-err">CF 深度识别 (CIDR + CNAME + CF-RAY 响应头)</span>
+      <span class="badge b-err">剔除大陆节点大厂</span>
+    </div>
+  </div>
+
+  <div class="panel" id="progressPanel" style="display:none;">
+    <div style="display:flex;justify-content:space-between;font-size:0.9rem;">
+      <span id="statusLabel">正在检索相邻网段...</span>
+      <span id="pctLabel" style="font-family:monospace;color:var(--primary);font-weight:700;">0%</span>
+    </div>
+    <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="log-box" id="logBox"></div>
+  </div>
+
+  <div id="resultArea" style="display:none;">
+    <h3>🏆 建议选用的 Top 3 最佳 Reality SNI</h3>
+    <div class="grid-3" id="top3Container"></div>
+
+    <h3 style="margin-top:26px;">📋 全部合规 SNI 候选列表</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>当前解析 IP</th>
+          <th>候选域名 (SNI)</th>
+          <th>网段归属</th>
+          <th>协议与审计</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="allTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function addLog(msg) {
+  const box = document.getElementById("logBox");
+  const d = document.createElement("div");
+  d.textContent = `[${new Date().toTimeString().split(" ")[0]}] ${msg}`;
+  box.appendChild(d);
+  box.scrollTop = box.scrollHeight;
+}
+
+function setProgress(pct, label) {
+  document.getElementById("progressBar").style.width = pct + "%";
+  document.getElementById("pctLabel").textContent = pct + "%";
+  if (label) document.getElementById("statusLabel").textContent = label;
+}
+
+async function startScan() {
+  const ip = document.getElementById("ipInput").value.trim();
+  const scope = document.getElementById("scopeSelect").value;
+  if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) {
+    alert("请输入合法的公网 IPv4 地址");
+    return;
+  }
+
+  const scanBtn = document.getElementById("scanBtn");
+  scanBtn.disabled = true;
+  document.getElementById("progressPanel").style.display = "block";
+  document.getElementById("resultArea").style.display = "none";
+  document.getElementById("logBox").innerHTML = "";
+  setProgress(5, "阶段 1/2：正在检索相邻子网关联域名...");
+
+  try {
+    // 1. 调用 Pages Function 检索相邻网段候选域名
+    const discRes = await fetch(`/api/discover?ip=${encodeURIComponent(ip)}&scope=${scope}`);
+    const discData = await discRes.json();
+
+    if (!discRes.ok || discData.error) {
+      addLog(`❌ ${discData.error || "检索失败"}`);
+      scanBtn.disabled = false;
+      return;
+    }
+
+    const candidates = discData.candidates || [];
+    addLog(`锚定相邻网段: ${discData.subnets.join(", ")}`);
+    addLog(`阶段 1 完成，共检索出 ${candidates.length} 个候选独立域名，开始真实 HTTPS 握手与 Cloudflare 深度审计...`);
+    setProgress(25, `阶段 2/2：正在验证 ${candidates.length} 个候选域名...`);
+
+    const parts = ip.split(".");
+    const prefix = `${parts[0]}.${parts[1]}.`;
+    const allVerified = [];
+    const batchSize = 10;
+
+    // 2. 分批提交给 Pages Function 验证（严格规避边缘节点子请求上限）
+    for (let i = 0; i < candidates.length; i += batchSize) {
+      const batch = candidates.slice(i, i + batchSize);
+      const verRes = await fetch("/api/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: batch, prefix })
+      });
+
+      if (verRes.ok) {
+        const verData = await verRes.json();
+        for (const b of verData.blocked || []) {
+          addLog(`🚫 拦截 ${b.domain} -> ${b.reason}`);
+        }
+        for (const v of verData.verified || []) {
+          allVerified.push(v);
+          addLog(`✅ 通过验证: ${v.domain} (${v.ip})`);
+        }
+      }
+
+      const done = Math.min(i + batchSize, candidates.length);
+      const pct = 25 + Math.round((done / Math.max(candidates.length, 1)) * 75);
+      setProgress(pct, `阶段 2/2：已验证 ${done}/${candidates.length} 个域名，累计合规 ${allVerified.length} 个`);
+    }
+
+    allVerified.sort((a, b) => a.dist - b.dist);
+    setProgress(100, "全部扫描与深度审计完成！");
+    addLog(`🎉 审计结束！共筛选出 ${allVerified.length} 个符合 Reality 要求的 SNI。`);
+    renderResults(allVerified);
+  } catch (err) {
+    addLog(`⚠️ 请求异常: ${err.message}`);
+  } finally {
+    scanBtn.disabled = false;
+  }
+}
+
+function renderResults(list) {
+  document.getElementById("resultArea").style.display = "block";
+  const top3Box = document.getElementById("top3Container");
+  top3Box.innerHTML = "";
+
+  if (!list || list.length === 0) {
+    top3Box.innerHTML = `<div class="card" style="grid-column:1/-1;">
+      <div class="domain">当前相邻网段未检索到符合条件的公开域名</div>
+      <p style="color:var(--muted);margin-top:8px;">该云厂商子网可能未开启公开反向解析或无历史绑定域名。</p>
+    </div>`;
+    return;
+  }
+
+  list.slice(0, 3).forEach((item, idx) => {
+    const card = document.createElement("div");
+    card.className = `card ${idx === 0 ? "top1" : ""}`;
+    card.innerHTML = `
+      <span class="rank">推荐 #${idx + 1}</span>
+      <div class="domain">${item.domain}</div>
+      <div class="meta">解析 IP: ${item.ip} (${item.sameBlock ? "同机房相邻段" : "同区域邻近段"})</div>
+      <div style="margin-bottom:12px;">
+        <span class="badge b-ok">TLS 1.3 & HTTP/2 ✓</span>
+        <span class="badge b-info">独立源站 (非CF/非大厂) ✓</span>
+      </div>
+      <button class="btn-sm" onclick="copyText('${item.domain}', this)">复制此 SNI</button>
+    `;
+    top3Box.appendChild(card);
+  });
+
+  const tbody = document.getElementById("allTable");
+  tbody.innerHTML = "";
+  list.forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="font-family:monospace;">${item.ip}</td>
+      <td style="font-family:monospace;font-weight:700;color:#fff;">${item.domain}</td>
+      <td>${item.sameBlock ? '<span class="badge b-ok">同 /16 机房段</span>' : '<span class="badge b-info">历史关联段</span>'}</td>
+      <td><span class="badge b-ok">HTTPS 实测通过 · 非CF</span></td>
+      <td><button class="btn-sm" onclick="copyText('${item.domain}', this)">复制</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function copyText(txt, btn) {
+  navigator.clipboard.writeText(txt).then(() => {
+    const old = btn.textContent;
+    btn.textContent = "已复制 ✓";
+    setTimeout(() => (btn.textContent = old), 1500);
+  });
+}
+</script>
+</body>
+</html>
