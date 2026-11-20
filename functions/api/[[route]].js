@@ -6,7 +6,7 @@ const CF_CIDRS = [
   "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22"
 ];
 
-// 大陆有 CDN 节点的大厂及云默认域名关键字黑名单
+// 在中国大陆拥有 CDN 节点的大厂及云默认域名关键字黑名单
 const BIG_TECH_KEYWORDS = [
   "microsoft", "azure", "msn.com", "live.com", "office.com", "windows", "bing.com", "xbox",
   "apple.com", "icloud", "akadns", "akamai", "akamaiedge", "akamaitechnologies",
@@ -19,8 +19,17 @@ const BIG_TECH_KEYWORDS = [
   "cloudapp", "compute.internal", "ec2.internal"
 ];
 
+const FETCH_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "Accept": "application/json"
+};
+
 function ipToInt(ip) {
   return ip.split(".").reduce((acc, oct) => (acc << 8) + parseInt(oct, 10), 0) >>> 0;
+}
+
+function intToIp(int) {
+  return [(int >>> 24) & 255, (int >>> 16) & 255, (int >>> 8) & 255, int & 255].join(".");
 }
 
 function isIpInCfCidr(ip) {
@@ -48,6 +57,7 @@ function isPrivateOrReservedIp(ip) {
 function isBlacklistedName(domain) {
   const d = domain.toLowerCase().trim().replace(/\.$/, "");
   if (!d || d.startsWith("*") || !d.includes(".")) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(d)) return true;
   if (BIG_TECH_KEYWORDS.some((kw) => d.includes(kw))) return true;
   if (/(\d{1,3}[-_.]){3}\d{1,3}/.test(d)) return true;
   return false;
@@ -63,7 +73,7 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-async function fetchWithTimeout(url, options = {}, ms = 3000) {
+async function fetchWithTimeout(url, options = {}, ms = 4500) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -73,87 +83,87 @@ async function fetchWithTimeout(url, options = {}, ms = 3000) {
   }
 }
 
-// 阶段 1：挖掘相邻子网关联域名（严格控制在 25 次子请求以内）
+// 阶段 1：利用 Urlscan.io 整段测绘 + Shodan InternetDB 挖掘相邻机房域名
 async function handleDiscover(url) {
   const targetIp = (url.searchParams.get("ip") || "").trim();
-  const scope = Math.min(2, Math.max(1, parseInt(url.searchParams.get("scope") || "2", 10)));
+  const scope = Math.min(4, Math.max(1, parseInt(url.searchParams.get("scope") || "2", 10)));
 
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(targetIp) || isPrivateOrReservedIp(targetIp)) {
     return jsonResponse({ error: "请输入合法的公网 IPv4 地址" }, 400);
   }
 
   const parts = targetIp.split(".").map(Number);
-  const subnets = [parts[2]];
-  if (scope >= 2) {
-    subnets.push(parts[2] > 0 ? parts[2] - 1 : parts[2] + 1);
-  }
-
-  const candidateMap = new Map(); // domain -> { domain, sourceIp, dist }
+  const targetInt = ipToInt(targetIp);
+  const candidateMap = new Map(); // domain -> { domain, sourceIp, dist, hintServer }
+  const debugLogs = [];
   const tasks = [];
 
-  // 1. 整段 /24 反向 IP 批量检索（每个 /24 仅消耗 1 个子请求）
-  for (const sub of subnets) {
-    const cidr = `${parts[0]}.${parts[1]}.${sub}.0/24`;
-    tasks.push(
-      fetchWithTimeout(`https://api.hackertarget.com/reverseiplookup/?q=${cidr}`, {}, 4000)
-        .then(async (res) => {
-          if (!res.ok) return;
-          const text = await res.text();
-          if (text.includes("error") || text.includes("API count exceeded")) return;
-          for (const line of text.split("\n")) {
-            const d = line.trim().toLowerCase();
-            if (d && !isBlacklistedName(d) && !candidateMap.has(d)) {
-              const dist = Math.abs(sub - parts[2]) * 256 + 64;
-              candidateMap.set(d, { domain: d, sourceIp: `${parts[0]}.${parts[1]}.${sub}.x`, dist });
-            }
-          }
-        })
-        .catch(() => {})
-    );
-  }
+  // 计算搜索的 CIDR 网段（/24、/23 或 /22）
+  const cidrBits = scope === 1 ? 24 : scope === 2 ? 23 : 22;
+  const mask = ~(2 ** (32 - cidrBits) - 1) >>> 0;
+  const networkBase = intToIp((targetInt & mask) >>> 0);
+  const targetCidr = `${networkBase}/${cidrBits}`;
 
-  // 2. 针对目标 IP 及最邻近的 8 个邻居 IP 查询 Passive DNS（解决无 PTR 问题）
-  const neighborIps = [targetIp];
-  for (let offset = 1; offset <= 4; offset++) {
+  // 数据源 1：Urlscan.io 整段 CIDR 测绘搜索（1 次请求直接捞出整个相邻 /23 或 /22 内的真实 Web 站点）
+  tasks.push(
+    fetchWithTimeout(
+      `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(`ip:${targetCidr}`)}&size=100`,
+      { headers: FETCH_HEADERS },
+      5500
+    )
+      .then(async (res) => {
+        if (!res.ok) {
+          debugLogs.push(`Urlscan 测绘接口返回状态码 ${res.status}`);
+          return;
+        }
+        const data = await res.json();
+        const rows = data.results || [];
+        debugLogs.push(`Urlscan 测绘库在 ${targetCidr} 网段检索到 ${rows.length} 条历史网页快照`);
+        for (const r of rows) {
+          const page = r.page || {};
+          const d = (page.domain || "").trim().toLowerCase();
+          const pip = (page.ip || "").trim();
+          const srv = (page.server || "").toLowerCase();
+          if (!d || isBlacklistedName(d)) continue;
+          // 初步过滤已明确标注为 cloudflare 的历史快照
+          if (srv.includes("cloudflare")) continue;
+
+          const dist = /^\d{1,3}(\.\d{1,3}){3}$/.test(pip)
+            ? Math.abs(ipToInt(pip) - targetInt)
+            : 256;
+
+          if (!candidateMap.has(d) || candidateMap.get(d).dist > dist) {
+            candidateMap.set(d, { domain: d, sourceIp: pip || networkBase, dist });
+          }
+        }
+      })
+      .catch((err) => {
+        debugLogs.push(`Urlscan 查询异常: ${err.message}`);
+      })
+  );
+
+  // 数据源 2：Shodan InternetDB 查询最邻近的 24 个 IP 的开放端口与主机名
+  const neighborIps = [];
+  for (let offset = 1; offset <= 12; offset++) {
     if (parts[3] - offset >= 1) neighborIps.push(`${parts[0]}.${parts[1]}.${parts[2]}.${parts[3] - offset}`);
     if (parts[3] + offset <= 254) neighborIps.push(`${parts[0]}.${parts[1]}.${parts[2]}.${parts[3] + offset}`);
   }
 
-  for (const nip of neighborIps.slice(0, 8)) {
-    const nParts = nip.split(".").map(Number);
-    const dist = Math.abs(nParts[2] - parts[2]) * 256 + Math.abs(nParts[3] - parts[3]);
+  let shodanHits = 0;
+  for (const nip of neighborIps) {
+    const dist = Math.abs(ipToInt(nip) - targetInt);
     tasks.push(
-      fetchWithTimeout(`https://otx.alienvault.com/api/v1/indicators/IPv4/${nip}/passive_dns`, {}, 3500)
+      fetchWithTimeout(`https://internetdb.shodan.io/${nip}`, { headers: FETCH_HEADERS }, 3500)
         .then(async (res) => {
           if (!res.ok) return;
           const data = await res.json();
-          for (const rec of data.passive_dns || []) {
-            const d = (rec.hostname || "").trim().toLowerCase();
-            if (d && !isBlacklistedName(d) && !candidateMap.has(d)) {
-              candidateMap.set(d, { domain: d, sourceIp: nip, dist });
-            }
-          }
-        })
-        .catch(() => {})
-    );
-  }
-
-  // 3. 并发查询最邻近 12 个 IP 的 DoH PTR 记录
-  for (const nip of neighborIps.slice(0, 12)) {
-    const rev = nip.split(".").reverse().join(".") + ".in-addr.arpa";
-    const nParts = nip.split(".").map(Number);
-    const dist = Math.abs(nParts[2] - parts[2]) * 256 + Math.abs(nParts[3] - parts[3]);
-    tasks.push(
-      fetchWithTimeout(`https://cloudflare-dns.com/dns-query?name=${rev}&type=12`, {
-        headers: { Accept: "application/dns-json" }
-      }, 2500)
-        .then(async (res) => {
-          if (!res.ok) return;
-          const data = await res.json();
-          for (const ans of data.Answer || []) {
-            if (ans.type === 12 && ans.data) {
-              const d = ans.data.replace(/\.$/, "").toLowerCase();
+          const ports = data.ports || [];
+          const hosts = data.hostnames || [];
+          if (ports.includes(443) && hosts.length > 0) {
+            for (const h of hosts) {
+              const d = h.trim().toLowerCase();
               if (!isBlacklistedName(d) && !candidateMap.has(d)) {
+                shodanHits++;
                 candidateMap.set(d, { domain: d, sourceIp: nip, dist });
               }
             }
@@ -164,18 +174,20 @@ async function handleDiscover(url) {
   }
 
   await Promise.all(tasks);
+  debugLogs.push(`Shodan InternetDB 从邻近 IP 443 端口提取到 ${shodanHits} 个主机名`);
 
   const candidates = Array.from(candidateMap.values())
     .sort((a, b) => a.dist - b.dist)
     .slice(0, 60);
 
   return jsonResponse({
-    subnets: subnets.map((s) => `${parts[0]}.${parts[1]}.${s}.0/24`),
+    cidr: targetCidr,
+    debugLogs,
     candidates
   });
 }
 
-// 阶段 2：分批验证候选域名（每批最多 12 个域名，约 24 个子请求，安全不超限）
+// 阶段 2：分批验证候选域名（真实 HTTPS 握手 + 多维 Cloudflare 深度过滤）
 async function handleVerify(request) {
   let body;
   try {
@@ -184,8 +196,8 @@ async function handleVerify(request) {
     return jsonResponse({ error: "无效的请求体" }, 400);
   }
 
-  const items = Array.isArray(body.items) ? body.items.slice(0, 12) : [];
-  const targetPrefix = (body.prefix || "").trim(); // 例如 "20.249."
+  const items = Array.isArray(body.items) ? body.items.slice(0, 10) : [];
+  const targetPrefix = (body.prefix || "").trim();
   const verified = [];
   const blocked = [];
 
@@ -201,7 +213,7 @@ async function handleVerify(request) {
         const dnsRes = await fetchWithTimeout(
           `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=1`,
           { headers: { Accept: "application/dns-json" } },
-          2500
+          3000
         );
         if (dnsRes.ok) {
           const dnsData = await dnsRes.json();
@@ -216,7 +228,6 @@ async function handleVerify(request) {
 
       if (resolvedIps.length === 0) return;
 
-      // 检查 CNAME 是否指向 Cloudflare 或大厂
       for (const cn of cnames) {
         if (cn.includes("cloudflare") || isBlacklistedName(cn)) {
           blocked.push({ domain, reason: `CNAME 命中黑名单 (${cn})` });
@@ -224,23 +235,22 @@ async function handleVerify(request) {
         }
       }
 
-      // 检查是否命中 Cloudflare IPv4 CIDR
       const cfIp = resolvedIps.find((ip) => isIpInCfCidr(ip));
       if (cfIp) {
         blocked.push({ domain, reason: `解析 IP 命中 Cloudflare CIDR (${cfIp})` });
         return;
       }
 
-      // 2. 发起真实 HTTPS HEAD 请求，检查 TLS 连通性与 Cloudflare 特征响应头 (CF-RAY / Server)
+      // 2. 发起真实 HTTPS 请求验证 TLS 连通性并审计响应头
       try {
         const headRes = await fetchWithTimeout(
           `https://${domain}/`,
           {
             method: "HEAD",
             redirect: "manual",
-            headers: { "User-Agent": "Mozilla/5.0" }
+            headers: { "User-Agent": FETCH_HEADERS["User-Agent"] }
           },
-          3000
+          3500
         );
 
         const serverHdr = (headRes.headers.get("server") || "").toLowerCase();
@@ -262,7 +272,7 @@ async function handleVerify(request) {
           sameBlock
         });
       } catch {
-        // HTTPS 握手失败或超时，直接淘汰
+        // HTTPS 握手失败或超时
       }
     })
   );
