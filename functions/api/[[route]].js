@@ -32,6 +32,11 @@ function intToIp(int) {
   return [(int >>> 24) & 255, (int >>> 16) & 255, (int >>> 8) & 255, int & 255].join(".");
 }
 
+function getCidrBlock(ipInt, bits) {
+  const mask = ~(2 ** (32 - bits) - 1) >>> 0;
+  return `${intToIp((ipInt & mask) >>> 0)}/${bits}`;
+}
+
 function isIpInCfCidr(ip) {
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return false;
   const target = ipToInt(ip);
@@ -73,7 +78,7 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-async function fetchWithTimeout(url, options = {}, ms = 4500) {
+async function fetchWithTimeout(url, options = {}, ms = 5000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -83,7 +88,41 @@ async function fetchWithTimeout(url, options = {}, ms = 4500) {
   }
 }
 
-// 阶段 1：利用 Urlscan.io 整段测绘 + Shodan InternetDB 挖掘相邻机房域名
+async function queryUrlscanCidr(cidr, targetInt, candidateMap, debugLogs) {
+  // 关键修复：CIDR 必须用双引号包裹 ip:"x.x.x.x/xx"，否则 / 会触发 Lucene 正则语法报错 400
+  const query = `ip:"${cidr}"`;
+  const url = `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(query)}&size=100`;
+  try {
+    const res = await fetchWithTimeout(url, { headers: FETCH_HEADERS }, 6000);
+    if (!res.ok) {
+      debugLogs.push(`Urlscan (${cidr}) 返回状态码 ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    const rows = data.results || [];
+    debugLogs.push(`Urlscan 在 ${cidr} 网段检索到 ${rows.length} 条历史网页快照`);
+    for (const r of rows) {
+      const page = r.page || {};
+      const d = (page.domain || "").trim().toLowerCase();
+      const pip = (page.ip || "").trim();
+      const srv = (page.server || "").toLowerCase();
+      if (!d || isBlacklistedName(d)) continue;
+      if (srv.includes("cloudflare")) continue;
+
+      const dist = /^\d{1,3}(\.\d{1,3}){3}$/.test(pip)
+        ? Math.abs(ipToInt(pip) - targetInt)
+        : 1024;
+
+      if (!candidateMap.has(d) || candidateMap.get(d).dist > dist) {
+        candidateMap.set(d, { domain: d, sourceIp: pip || cidr.split("/")[0], dist });
+      }
+    }
+  } catch (err) {
+    debugLogs.push(`Urlscan (${cidr}) 请求超时或异常: ${err.message}`);
+  }
+}
+
+// 阶段 1：挖掘相邻子网关联域名
 async function handleDiscover(url) {
   const targetIp = (url.searchParams.get("ip") || "").trim();
   const scope = Math.min(4, Math.max(1, parseInt(url.searchParams.get("scope") || "2", 10)));
@@ -94,94 +133,61 @@ async function handleDiscover(url) {
 
   const parts = targetIp.split(".").map(Number);
   const targetInt = ipToInt(targetIp);
-  const candidateMap = new Map(); // domain -> { domain, sourceIp, dist, hintServer }
+  const candidateMap = new Map();
   const debugLogs = [];
-  const tasks = [];
 
-  // 计算搜索的 CIDR 网段（/24、/23 或 /22）
   const cidrBits = scope === 1 ? 24 : scope === 2 ? 23 : 22;
-  const mask = ~(2 ** (32 - cidrBits) - 1) >>> 0;
-  const networkBase = intToIp((targetInt & mask) >>> 0);
-  const targetCidr = `${networkBase}/${cidrBits}`;
+  const primaryCidr = getCidrBlock(targetInt, cidrBits);
 
-  // 数据源 1：Urlscan.io 整段 CIDR 测绘搜索（1 次请求直接捞出整个相邻 /23 或 /22 内的真实 Web 站点）
-  tasks.push(
-    fetchWithTimeout(
-      `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(`ip:${targetCidr}`)}&size=100`,
-      { headers: FETCH_HEADERS },
-      5500
-    )
-      .then(async (res) => {
-        if (!res.ok) {
-          debugLogs.push(`Urlscan 测绘接口返回状态码 ${res.status}`);
-          return;
-        }
-        const data = await res.json();
-        const rows = data.results || [];
-        debugLogs.push(`Urlscan 测绘库在 ${targetCidr} 网段检索到 ${rows.length} 条历史网页快照`);
-        for (const r of rows) {
-          const page = r.page || {};
-          const d = (page.domain || "").trim().toLowerCase();
-          const pip = (page.ip || "").trim();
-          const srv = (page.server || "").toLowerCase();
-          if (!d || isBlacklistedName(d)) continue;
-          // 初步过滤已明确标注为 cloudflare 的历史快照
-          if (srv.includes("cloudflare")) continue;
+  // 1. 先检索选定相邻网段（/24、/23 或 /22）
+  await queryUrlscanCidr(primaryCidr, targetInt, candidateMap, debugLogs);
 
-          const dist = /^\d{1,3}(\.\d{1,3}){3}$/.test(pip)
-            ? Math.abs(ipToInt(pip) - targetInt)
-            : 256;
+  // 2. 若相邻子网内被收录的公开站点不足 6 个，自动扩展至同机房分配块 (/20) 补充并按 IP 距离排序
+  if (candidateMap.size < 6) {
+    const parentCidr20 = getCidrBlock(targetInt, 20);
+    if (parentCidr20 !== primaryCidr) {
+      debugLogs.push(`相邻网段候选较少，自动扩展至同机房分配块 ${parentCidr20} 补充搜索...`);
+      await queryUrlscanCidr(parentCidr20, targetInt, candidateMap, debugLogs);
+    }
+  }
 
-          if (!candidateMap.has(d) || candidateMap.get(d).dist > dist) {
-            candidateMap.set(d, { domain: d, sourceIp: pip || networkBase, dist });
-          }
-        }
-      })
-      .catch((err) => {
-        debugLogs.push(`Urlscan 查询异常: ${err.message}`);
-      })
-  );
-
-  // 数据源 2：Shodan InternetDB 查询最邻近的 24 个 IP 的开放端口与主机名
+  // 3. 补充查询最邻近 20 个 IP 的 Shodan InternetDB 记录
   const neighborIps = [];
-  for (let offset = 1; offset <= 12; offset++) {
+  for (let offset = 1; offset <= 10; offset++) {
     if (parts[3] - offset >= 1) neighborIps.push(`${parts[0]}.${parts[1]}.${parts[2]}.${parts[3] - offset}`);
     if (parts[3] + offset <= 254) neighborIps.push(`${parts[0]}.${parts[1]}.${parts[2]}.${parts[3] + offset}`);
   }
 
   let shodanHits = 0;
-  for (const nip of neighborIps) {
-    const dist = Math.abs(ipToInt(nip) - targetInt);
-    tasks.push(
-      fetchWithTimeout(`https://internetdb.shodan.io/${nip}`, { headers: FETCH_HEADERS }, 3500)
-        .then(async (res) => {
-          if (!res.ok) return;
-          const data = await res.json();
-          const ports = data.ports || [];
-          const hosts = data.hostnames || [];
-          if (ports.includes(443) && hosts.length > 0) {
-            for (const h of hosts) {
-              const d = h.trim().toLowerCase();
-              if (!isBlacklistedName(d) && !candidateMap.has(d)) {
-                shodanHits++;
-                candidateMap.set(d, { domain: d, sourceIp: nip, dist });
-              }
+  await Promise.all(
+    neighborIps.map(async (nip) => {
+      const dist = Math.abs(ipToInt(nip) - targetInt);
+      try {
+        const res = await fetchWithTimeout(`https://internetdb.shodan.io/${nip}`, { headers: FETCH_HEADERS }, 3500);
+        if (!res.ok) return;
+        const data = await res.json();
+        const ports = data.ports || [];
+        const hosts = data.hostnames || [];
+        if (ports.includes(443) && hosts.length > 0) {
+          for (const h of hosts) {
+            const d = h.trim().toLowerCase();
+            if (!isBlacklistedName(d) && !candidateMap.has(d)) {
+              shodanHits++;
+              candidateMap.set(d, { domain: d, sourceIp: nip, dist });
             }
           }
-        })
-        .catch(() => {})
-    );
-  }
-
-  await Promise.all(tasks);
+        }
+      } catch {}
+    })
+  );
   debugLogs.push(`Shodan InternetDB 从邻近 IP 443 端口提取到 ${shodanHits} 个主机名`);
 
   const candidates = Array.from(candidateMap.values())
     .sort((a, b) => a.dist - b.dist)
-    .slice(0, 60);
+    .slice(0, 50);
 
   return jsonResponse({
-    cidr: targetCidr,
+    cidr: primaryCidr,
     debugLogs,
     candidates
   });
@@ -206,7 +212,6 @@ async function handleVerify(request) {
       const domain = (item.domain || "").toLowerCase().trim();
       if (!domain || isBlacklistedName(domain)) return;
 
-      // 1. DoH 查询 A 记录与 CNAME 链
       let resolvedIps = [];
       let cnames = [];
       try {
@@ -241,7 +246,6 @@ async function handleVerify(request) {
         return;
       }
 
-      // 2. 发起真实 HTTPS 请求验证 TLS 连通性并审计响应头
       try {
         const headRes = await fetchWithTimeout(
           `https://${domain}/`,
@@ -271,9 +275,7 @@ async function handleVerify(request) {
           dist: sameBlock ? item.dist : item.dist + 500,
           sameBlock
         });
-      } catch {
-        // HTTPS 握手失败或超时
-      }
+      } catch {}
     })
   );
 
